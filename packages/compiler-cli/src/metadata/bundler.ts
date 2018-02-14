@@ -57,6 +57,14 @@ interface Symbol {
   privateName?: string;
 }
 
+interface ModuleLocationInfo {
+  // The root-relative module source file path (e.g. `./foo/index` or `./foo`)
+  modulePath: string;
+
+  // The root-relative module root path (e.g. `./foo` or `./`)
+  moduleRoot: string;
+}
+
 export interface BundleEntries { [name: string]: MetadataEntry; }
 
 export interface BundlePrivateEntry {
@@ -71,7 +79,8 @@ export interface BundledModule {
 }
 
 export interface MetadataBundlerHost {
-  getMetadataFor(moduleName: string): ModuleMetadata|undefined;
+  getMetadataFor(fileName: string): ModuleMetadata|undefined;
+  fileExists(fileName: string): boolean;
 }
 
 type StaticsMetadata = {
@@ -83,11 +92,13 @@ export class MetadataBundler {
   private metadataCache = new Map<string, ModuleMetadata|undefined>();
   private exports = new Map<string, Symbol[]>();
   private rootModule: string;
+  private rootModuleDir: string;
   private exported: Set<Symbol>;
 
   constructor(
-      private root: string, private importAs: string|undefined, private host: MetadataBundlerHost) {
+    private root: string, private importAs: string|undefined, private host: MetadataBundlerHost) {
     this.rootModule = `./${path.basename(root)}`;
+    this.rootModuleDir = path.dirname(root); // NOTE: assuming root is not a barrel
   }
 
   getMetadataBundle(): BundledModule {
@@ -115,23 +126,21 @@ export class MetadataBundler {
       metadata: {
         __symbolic: 'module',
         version: METADATA_VERSION,
-        exports: exports.length ? exports : undefined, metadata, origins,
+        exports: exports.length ? exports : undefined,
+        metadata,
+        origins,
         importAs: this.importAs !
       },
       privates
     };
   }
 
-  static resolveModule(importName: string, from: string): string {
-    return resolveModule(importName, from);
-  }
-
   private getMetadata(moduleName: string): ModuleMetadata|undefined {
     let result = this.metadataCache.get(moduleName);
     if (!result) {
       if (moduleName.startsWith('.')) {
-        const fullModuleName = resolveModule(moduleName, this.root);
-        result = this.host.getMetadataFor(fullModuleName);
+        const fullModuleName = this.resolveModulePath(moduleName);
+        result = this.host.getMetadataFor(path.join(this.rootModuleDir, fullModuleName));
       }
       this.metadataCache.set(moduleName, result);
     }
@@ -161,7 +170,7 @@ export class MetadataBundler {
         const data = module.metadata[key];
         if (isMetadataImportedSymbolReferenceExpression(data)) {
           // This is a re-export of an imported symbol. Record this as a re-export.
-          const exportFrom = resolveModule(data.module, moduleName);
+          const exportFrom = this.resolveModulePath(data.module, moduleName);
           this.exportAll(exportFrom);
           const symbol = this.symbolOf(exportFrom, data.name);
           exportSymbol(symbol, key);
@@ -175,7 +184,7 @@ export class MetadataBundler {
     // Export all the re-exports from this module
     if (module && module.exports) {
       for (const exportDeclaration of module.exports) {
-        const exportFrom = resolveModule(exportDeclaration.from, moduleName);
+        const exportFrom = this.resolveModulePath(exportDeclaration.from, moduleName);
         // Record all the exports from the module even if we don't use it directly.
         const exportedSymbols = this.exportAll(exportFrom);
         if (exportDeclaration.export) {
@@ -527,7 +536,7 @@ export class MetadataBundler {
       if (value.module.startsWith('.')) {
         // Reference is to a symbol defined inside the module. Convert the reference to a reference
         // to the canonical symbol.
-        const referencedModule = resolveModule(value.module, moduleName);
+        const referencedModule = this.resolveModulePath(value.module, moduleName);
         const referencedName = value.name;
         return createReference(this.canonicalSymbolOf(referencedModule, referencedName));
       }
@@ -589,6 +598,65 @@ export class MetadataBundler {
     }
     return symbol;
   }
+
+  /**
+   * Resolves a root-relative module path.
+   * @param moduleName "From"-relative module path
+   * @param fromModuleName "Root"-relative module path. If omitted, defaults to `rootModuleDir`
+   */
+  private resolveModulePath(moduleName: string, fromModuleName?: string): string /* root-relative module path */ {
+    if (!moduleName.startsWith('.')) {
+      // direct import e.g. '@angular/core'
+      return moduleName;
+    }
+    // TODO: Can we do this more efficiently?
+    
+    // If no "from" module name is provided, resolve from the bundler root
+    let moduleRoot = '.';
+    if (fromModuleName) {
+      // Otherwise, resolve the root of the "from" module
+      moduleRoot = this.getModuleLocationInfo(fromModuleName).moduleRoot;
+    }
+
+    let modulePath = this.getModuleLocationInfo(path.join(moduleRoot, moduleName)).modulePath;
+    let normalized = path.normalize(modulePath);
+    if (!normalized.startsWith('.')) {
+      // path.normalize strips the leading ./
+      normalized = '.' + path.sep + normalized;
+    }
+    // Replace windows path delimiters with forward-slashes. Otherwise the paths are not
+    // TypeScript compatible when building the bundle.
+    return normalized.replace(/\\/g, '/');
+  }
+
+  private moduleLocationCache: { [moduleName: string]: ModuleLocationInfo } = {};
+  private getModuleLocationInfo(moduleName: string): ModuleLocationInfo {
+    let result = this.moduleLocationCache[moduleName];
+    if (result !== undefined) {
+      return result;
+    }
+    // NOTE: `testPath` is the absolute path to the source file
+    // Test for a source file with the same name
+    // E.g. /foo/bar.ts
+    let testPath = path.join(this.rootModuleDir, moduleName);
+    let modulePath = moduleName;
+    if (!this.host.fileExists(testPath)) {
+      // Test for a barrel file
+      // E.g. /foo/bar/index.ts
+      testPath = path.join(this.rootModuleDir, moduleName, 'index');
+      modulePath = moduleName + path.sep + 'index';
+      if (!this.host.fileExists(testPath)) {
+        // Source code is invalid?
+        throw new Error(`Source file expected at ${moduleName}!`);
+      }
+    }
+    result = {
+      moduleRoot: path.dirname(modulePath),
+      modulePath: modulePath
+    };
+    this.moduleLocationCache[moduleName] = result;
+    return result;
+  }
 }
 
 export class CompilerHostAdapter implements MetadataBundlerHost {
@@ -600,20 +668,10 @@ export class CompilerHostAdapter implements MetadataBundlerHost {
     const sourceFile = this.host.getSourceFile(fileName + '.ts', ts.ScriptTarget.Latest);
     return sourceFile && this.collector.getMetadata(sourceFile);
   }
-}
 
-function resolveModule(importName: string, from: string): string {
-  if (importName.startsWith('.') && from) {
-    let normalPath = path.normalize(path.join(path.dirname(from), importName));
-    if (!normalPath.startsWith('.') && from.startsWith('.')) {
-      // path.normalize() preserves leading '../' but not './'. This adds it back.
-      normalPath = `.${path.sep}${normalPath}`;
-    }
-    // Replace windows path delimiters with forward-slashes. Otherwise the paths are not
-    // TypeScript compatible when building the bundle.
-    return normalPath.replace(/\\/g, '/');
+  fileExists(fileName: string): boolean {
+    return this.host.fileExists(fileName + '.ts');
   }
-  return importName;
 }
 
 function isPrimitive(o: any): o is boolean|string|number {

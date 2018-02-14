@@ -22,23 +22,29 @@ describe('metadata bundler', () => {
     const bundler = new MetadataBundler('/lib/index', undefined, host);
     const result = bundler.getMetadataBundle();
     expect(Object.keys(result.metadata.metadata).sort()).toEqual([
-      'ONE_CLASSES', 'One', 'OneMore', 'TWO_CLASSES', 'Two', 'TwoMore', 'ɵa', 'ɵb'
+      'ONE_CLASSES', 'One', 'OneMore', 'THREE_CLASSES', 
+      'TWO_CLASSES', 'Three', 'ThreeMore', 'Two', 'TwoMore',
+      'ɵa', 'ɵb', 'ɵc',
     ]);
 
     const originalOne = './src/one';
     const originalTwo = './src/two/index';
+    const originalThree = './src/three/index';
     expect(Object.keys(result.metadata.origins !)
                .sort()
                .map(name => ({name, value: result.metadata.origins ![name]})))
         .toEqual([
-          {name: 'ONE_CLASSES', value: originalOne}, {name: 'One', value: originalOne},
-          {name: 'OneMore', value: originalOne}, {name: 'TWO_CLASSES', value: originalTwo},
-          {name: 'Two', value: originalTwo}, {name: 'TwoMore', value: originalTwo},
-          {name: 'ɵa', value: originalOne}, {name: 'ɵb', value: originalTwo}
+          {name: 'ONE_CLASSES', value: originalOne},{name: 'One', value: originalOne},
+          {name: 'OneMore', value: originalOne},{name: 'THREE_CLASSES', value: originalThree},
+          {name: 'TWO_CLASSES', value: originalTwo},{name: 'Three', value: originalThree},
+          {name: 'ThreeMore', value: originalThree},{name: 'Two', value: originalTwo},
+          {name: 'TwoMore', value: originalTwo},{name: 'ɵa', value: originalOne},
+          {name: 'ɵb', value: originalTwo},{name: 'ɵc', value: originalThree}
         ]);
     expect(result.privates).toEqual([
       {privateName: 'ɵa', name: 'PrivateOne', module: originalOne},
-      {privateName: 'ɵb', name: 'PrivateTwo', module: originalTwo}
+      {privateName: 'ɵb', name: 'PrivateTwo', module: originalTwo},
+      {privateName: 'ɵc', name: 'PrivateThree', module: originalThree}
     ]);
   });
 
@@ -235,18 +241,24 @@ export class MockStringBundlerHost implements MetadataBundlerHost {
   constructor(private dirName: string, private directory: Directory) {}
 
   getMetadataFor(moduleName: string): ModuleMetadata|undefined {
-    const fileName = path.join(this.dirName, moduleName) + '.ts';
-    const text = open(this.directory, fileName);
-    if (typeof text == 'string') {
-      const sourceFile = ts.createSourceFile(
-          fileName, text, ts.ScriptTarget.Latest, /* setParent */ true, ts.ScriptKind.TS);
-      const diagnostics: ts.Diagnostic[] = (sourceFile as any).parseDiagnostics;
-      if (diagnostics && diagnostics.length) {
-        throw Error('Unexpected syntax error in test');
-      }
-      const result = this.collector.getMetadata(sourceFile);
-      return result;
+    const sourceFilePath = path.join(this.dirName, moduleName) + '.ts';
+    const text = open(this.directory, sourceFilePath);
+    if (typeof text !== 'string') {
+      return undefined;
     }
+    const sourceFile = ts.createSourceFile(
+      sourceFilePath, text, ts.ScriptTarget.Latest, /* setParent */ true, ts.ScriptKind.TS
+    );
+    const diagnostics: ts.Diagnostic[] = (sourceFile as any).parseDiagnostics;
+    if (diagnostics && diagnostics.length) {
+      throw Error('Unexpected syntax error in test');
+    }
+    return sourceFile && this.collector.getMetadata(sourceFile);
+  }
+
+  fileExists(fileName: string): boolean {
+    const text = open(this.directory, fileName + '.ts');
+    return typeof text === 'string';
   }
 }
 
@@ -260,6 +272,7 @@ export const SIMPLE_LIBRARY = {
       'index.ts': `
         export {One, OneMore, ONE_CLASSES} from './one';
         export {Two, TwoMore, TWO_CLASSES} from './two/index';
+        export {Three, ThreeMore, THREE_CLASSES} from './three';
       `,
       'one.ts': `
         export class One {}
@@ -273,6 +286,14 @@ export const SIMPLE_LIBRARY = {
           export class TwoMore extends Two {}
           export class PrivateTwo {}
           export const TWO_CLASSES = [Two, TwoMore, PrivateTwo];
+        `
+      },
+      'three': {
+        'index.ts': `
+          export class Three {}
+          export class ThreeMore extends Three {}
+          export class PrivateThree {}
+          export const THREE_CLASSES = [Three, ThreeMore, PrivateThree];
         `
       }
     }

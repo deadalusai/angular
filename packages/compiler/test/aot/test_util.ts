@@ -434,6 +434,10 @@ export class MockMetadataBundlerHost implements MetadataBundlerHost {
     const source = this.host.getSourceFile(moduleName + '.ts', ts.ScriptTarget.Latest);
     return source && this.collector.getMetadata(source);
   }
+
+  fileExists(filePath: string): boolean {
+    return this.host.fileExists(filePath + '.ts');
+  }
 }
 
 function find(fileName: string, data: MockFileOrDirectory | undefined): MockFileOrDirectory|
